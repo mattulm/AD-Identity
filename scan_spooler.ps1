@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    Audits the Print Spooler service status on all Domain Controllers and sends a webhook alert if any are found RUNNING.
+    Audits the Print Spooler service status on all Domain Controllers using only base Windows cmdlets (DNS and Get-Service).
 
 .DESCRIPTION
-    1. Enumerates all Domain Controllers in the specified domain.
+    1. Enumerates all Domain Controllers via DNS SRV records.
     2. Connects to each DC using specified credentials.
-    3. Checks the status of the 'Spooler' service (Running/Stopped).
-    4. Sends a Webhook alert (Teams/Slack) if any Spoolers are found RUNNING.
+    3. Checks the status of the 'Spooler' service.
+    4. Sends a Webhook alert if any Spoolers are found RUNNING.
 
 .PARAMETER Domain
     The target Domain FQDN (e.g., contoso.local).
@@ -21,9 +21,8 @@
     Slack or Teams Webhook URL for notifications.
 
 .EXAMPLE
-    .\Audit-SpoolerNotify.ps1 -Domain yourdomain.local -Username 'Administrator' -Password 'SecureP@ssword123' -WebhookUrl 'https://hooks.slack.com/services/...'
-   
-    # Note: Requires the 'ActiveDirectory' module to use Get-ADDomainController, or you can use the DNS method (See notes below).
+    # Execute with credentials and a webhook URL
+    .\Audit-SpoolerNotify_NoAD.ps1 -Domain targetdomain.local -Username 'Administrator' -Password 'SecureP@ss' -WebhookUrl 'https://hooks.slack.com/services/...'
 #>
 [CmdletBinding()]
 param(
@@ -48,47 +47,23 @@ $ColorGreen = "`e[92m"
 $ColorReset = "`e[0m"
 
 # ---------------------------------------------------------
-# 1. DISCOVERY FUNCTION (AD based - Preferred in PowerShell)
+# 1. DISCOVERY FUNCTION (Pure DNS based)
 # ---------------------------------------------------------
-function Get-DomainControllers {
-    param([string]$TargetDomain)
-   
-    Write-Host "[*] Querying Active Directory for Domain Controllers in $TargetDomain..."
-   
-    try {
-        # Use Get-ADDomainController to find all DCs (Requires ActiveDirectory module)
-        $DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
-       
-        if (-not $DCs) {
-            Write-Warning "Could not find any Domain Controllers using Get-ADDomainController."
-            # Fallback to DNS-based discovery if AD module is not available or fails
-            $DCs = Get-DomainControllersDns $TargetDomain
-        }
-       
-        Write-Host "[*] Found $($DCs.Count) Domain Controllers."
-        return $DCs
-    }
-    catch {
-        Write-Error "AD Lookup failed: $($_.Exception.Message)"
-        # Fallback to DNS-based discovery
-        return Get-DomainControllersDns $TargetDomain
-    }
-}
-
-# DNS Fallback (Equivalent to the Python DNS logic)
 function Get-DomainControllersDns {
     param([string]$TargetDomain)
    
-    Write-Host "[*] Falling back to DNS SRV query for Domain Controllers..."
+    Write-Host "[*] Querying DNS SRV records for Domain Controllers in $TargetDomain..."
     $srvRecord = "_ldap._tcp.dc._msdcs.$TargetDomain"
    
     try {
-        # Resolve-DnsName queries DNS records
+        # Resolve-DnsName is a core cmdlet available in Windows 8 / Server 2012 and later
         $DnsAnswers = Resolve-DnsName -Name $srvRecord -Type SRV -ErrorAction Stop
+       
+        # Extract the target hostnames, remove trailing dots, and ensure uniqueness
         $DCs = $DnsAnswers.NameTarget | Select-Object -Unique | ForEach-Object { $_.TrimEnd('.') }
        
         if ($DCs.Count -eq 0) {
-             Write-Error "Could not find domain '$TargetDomain' via DNS SRV record."
+             Write-Error "Could not find domain '$TargetDomain' via DNS SRV record. Check domain spelling or DNS configuration."
              exit 1
         }
        
@@ -102,7 +77,7 @@ function Get-DomainControllersDns {
 }
 
 # ---------------------------------------------------------
-# 2. AUDIT FUNCTION (SCM based)
+# 2. AUDIT FUNCTION (SCM based - Unchanged)
 # ---------------------------------------------------------
 function Check-SpoolerStatus {
     param(
@@ -111,8 +86,7 @@ function Check-SpoolerStatus {
     )
 
     try {
-        # Get-Service connects to the SCM via RPC/WMI to query service status
-        # This requires appropriate permissions and for the target to be reachable
+        # Get-Service connects to the SCM (Service Control Manager) via RPC/WMI
         $Service = Get-Service -Name $ServiceName -ComputerName $Target -Credential $Credential -ErrorAction Stop
        
         switch ($Service.Status) {
@@ -130,14 +104,13 @@ function Check-SpoolerStatus {
             return "UNREACHABLE"
         }
         else {
-            # Return a short error for display
             return "RPC_ERROR"
         }
     }
 }
 
 # ---------------------------------------------------------
-# 3. NOTIFICATION FUNCTION (Webhook)
+# 3. NOTIFICATION FUNCTION (Webhook - Unchanged)
 # ---------------------------------------------------------
 function Send-WebhookAlert {
     param(
@@ -172,7 +145,7 @@ $HostsString
     $Payload = @{ text = $MessageText } | ConvertTo-Json
 
     try {
-        # Invoke-RestMethod sends an HTTP request
+        # Invoke-RestMethod is a core cmdlet for HTTP requests
         Invoke-RestMethod -Uri $Url -Method Post -Body $Payload -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop
         Write-Host "[+] Webhook alert sent successfully."
     }
@@ -189,8 +162,8 @@ $HostsString
 $SecurePassword = $Password | ConvertTo-SecureString -AsPlainText -Force
 $Credential = New-Object System.Management.Automation.PSCredential($Username, $SecurePassword)
 
-# 1. Discovery
-$DCs = Get-DomainControllers -TargetDomain $Domain
+# 1. Discovery (Uses the DNS function only)
+$DCs = Get-DomainControllersDns -TargetDomain $Domain
 
 Write-Host ""
 # Output Header
@@ -236,3 +209,4 @@ if ($VulnerableList.Count -gt 0) {
 }
 else {
     Write-Host "`n[*] Compliance Check Passed: No Spoolers Running."
+}
